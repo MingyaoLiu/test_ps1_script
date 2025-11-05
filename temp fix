@@ -44,3 +44,20 @@ bash --login -lc '
   }
   return $proc
 }
+
+
+
+#!/usr/bin/env bash
+
+trap 'echo "bye"; exit 0' INT TERM
+
+# (optional) nvm users:
+# export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh"
+
+while true; do
+  npm run start
+  code=$?
+  echo "npm exited with $code — restarting in 1s..."
+  sleep 1
+done
