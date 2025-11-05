@@ -1,13 +1,3 @@
-<#  Usage:
-      powershell -ExecutionPolicy Bypass -File .\flash-jetson-wsl-poll.ps1
-    Options:
-      -LinuxScript "~/flash_nano.sh"
-      -Distro "Ubuntu-24.04"              # blank = default WSL distro
-      -HardwareIds "0955:7f21","0955:7721"
-      -PollSeconds 1
-      -StopWhenScriptEnds $true           # end polling once WSL script exits
-#>
-
 [CmdletBinding()]
 param(
   [string]$LinuxScript = "~/flash_nano.sh",
@@ -21,7 +11,6 @@ function Ensure-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   $p  = New-Object Security.Principal.WindowsPrincipal($id)
   if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "Re-launching as Administrator..." -ForegroundColor Yellow
     $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell";
     $psi.Arguments = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" " + ($MyInvocation.UnboundArguments -join ' ')
     $psi.Verb = "runas"
@@ -29,26 +18,28 @@ function Ensure-Admin {
     exit
   }
 }
-Ensure-Admin
 
 function Parse-UsbipdList {
-  # Returns objects: BusId, VidPid, Raw, Attached, AttachedToWSL
+  # Returns objects: BusId, VidPid, Name, StateRaw, IsShared, IsAttachedToWSL
   $out = usbipd list 2>$null
   if (-not $out) { return @() }
   $items = @()
+
   foreach ($line in $out) {
-    # Typical line (may vary slightly by version):
-    # "4-4    0955:7f21  NVIDIA Corp. APX     Not attached"
-    # "4-4    0955:7f21  NVIDIA Corp. APX     Attached - WSL"
-    $m = [regex]::Match($line, "^(?<busid>\d+-\d+)\s+(?<vidpid>[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}).*?(?<state>Attached.*|Not attached)", 'IgnoreCase')
+    # Robustly capture: BUSID, VID:PID, NAME (e.g., APX), STATE (e.g., Shared (forced) / Attached - WSL / Not shared)
+    $m = [regex]::Match(
+      $line,
+      '^\s*(?<busid>\d+(?:-\d+)+)\s+(?<vidpid>[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4})\s+(?<name>.+?)\s{2,}(?<state>.+?)\s*$'
+    )
     if ($m.Success) {
       $state = $m.Groups['state'].Value
       $items += [pscustomobject]@{
-        BusId         = $m.Groups['busid'].Value
-        VidPid        = $m.Groups['vidpid'].Value.ToLower()
-        Raw           = $line
-        Attached      = $state -like "Attached*"
-        AttachedToWSL = $state -like "Attached - WSL*"
+        BusId          = $m.Groups['busid'].Value
+        VidPid         = $m.Groups['vidpid'].Value.ToLower()
+        Name           = $m.Groups['name'].Value.Trim()
+        StateRaw       = $state
+        IsShared       = ($state -like 'Shared*') -or ($state -like 'Attached*')
+        IsAttachedToWSL= ($state -like 'Attached - WSL*')
       }
     }
   }
@@ -65,16 +56,20 @@ function Find-MatchingDevices {
 
 function Bind-Attach-IfNeeded {
   param($dev)
-  # dev has BusId, VidPid, Attached, AttachedToWSL
   if (-not $dev) { return $false }
   $changed = $false
 
-  # Ensure bound (bind by busid — fastest/safest)
-  $bindRet = & usbipd bind --busid $dev.BusId --force 2>$null
-  $changed = $true
+  # Ensure device is shared (bound). "Shared (forced)" and "Attached - WSL" both count as shared.
+  if (-not $dev.IsShared) {
+    & usbipd bind --busid $dev.BusId --force 2>$null | Out-Null
+    $changed = $true
+  } else {
+    # Still try to refresh share in case it flipped states during re-enum; ignore errors.
+    & usbipd bind --busid $dev.BusId --force 2>$null | Out-Null
+  }
 
-  # If not attached to WSL, attach now
-  if (-not $dev.AttachedToWSL) {
+  # Ensure attached to WSL
+  if (-not $dev.IsAttachedToWSL) {
     & usbipd attach --wsl --busid $dev.BusId 2>$null | Out-Null
     $changed = $true
   }
@@ -82,6 +77,7 @@ function Bind-Attach-IfNeeded {
 }
 
 # --- Main ---
+Ensure-Admin
 Write-Host "Polling for Jetson (VID:PID = $($HardwareIds -join ', ')) without auto-attach..." -ForegroundColor Cyan
 
 $scriptStarted = $false
@@ -91,17 +87,16 @@ while ($true) {
   $matches = Find-MatchingDevices -Hids $HardwareIds
 
   if ($matches.Count -gt 0) {
-    # Prefer an already-attached-to-WSL device; otherwise take first match
-    $dev = ($matches | Where-Object {$_.AttachedToWSL} | Select-Object -First 1)
+    # Prefer something already attached to WSL, else first match
+    $dev = ($matches | Where-Object {$_.IsAttachedToWSL} | Select-Object -First 1)
     if (-not $dev) { $dev = $matches[0] }
 
     $did = Bind-Attach-IfNeeded -dev $dev
-    if ($did) {
-      Write-Host ("Attached {0} ({1}) to WSL" -f $dev.BusId, $dev.VidPid) -ForegroundColor Green
+    if ($did -or $dev.IsAttachedToWSL) {
+      Write-Host ("OK: {0} {1}  [{2}]" -f $dev.BusId, $dev.VidPid, $dev.StateRaw) -ForegroundColor Green
     }
 
-    # Launch the Linux script once (after we confirm an attached device)
-    if (-not $scriptStarted -and ($dev.AttachedToWSL -or $did)) {
+    if (-not $scriptStarted -and ($dev.IsAttachedToWSL -or $did)) {
       $scriptStarted = $true
       $wslCmd = if ($Distro) {
         @("wsl.exe","-d",$Distro,"--","bash","-lc",$LinuxScript)
@@ -112,16 +107,12 @@ while ($true) {
       $wslProc = Start-Process -PassThru -NoNewWindow -FilePath $wslCmd[0] -ArgumentList $wslCmd[1..($wslCmd.Count-1)]
     }
   } else {
-    # Nothing present right now
     Write-Host "Waiting for Jetson APX... (hold RECOVERY and plug USB)" -ForegroundColor DarkGray
   }
 
-  # If we’re set to stop when the WSL script ends, break out afterwards
-  if ($StopWhenScriptEnds -and $scriptStarted) {
-    if ($wslProc -and $wslProc.HasExited) {
-      Write-Host "WSL script ended (exit code $($wslProc.ExitCode)). Stopping poller." -ForegroundColor Yellow
-      break
-    }
+  if ($StopWhenScriptEnds -and $scriptStarted -and $wslProc -and $wslProc.HasExited) {
+    Write-Host "WSL script ended (exit $($wslProc.ExitCode)). Stopping poller." -ForegroundColor Yellow
+    break
   }
 
   Start-Sleep -Seconds $PollSeconds
