@@ -1,0 +1,46 @@
+function Ensure-InteractiveWSLConsole {
+  param([string]$Distro,[string]$ConsoleKind,[string]$PidFile,[string]$LinuxScript)
+
+  $existing = Get-TrackedConsole
+  if($existing){ return $existing }
+
+  # Command that runs your script in ~, then stays interactive.
+  # Ensures PATH sane and sources nvm if present.
+  $wslInit = @"
+env -i HOME=\$HOME TERM=xterm-256color SHELL=/bin/bash PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+bash --login -lc '
+  cd ~;
+  export NVM_DIR="\$HOME/.nvm";
+  [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh";
+  echo ">> running: $LinuxScript";
+  bash -lc "$LinuxScript";
+  echo ">> script finished; leaving interactive shell";
+  exec bash -i
+'
+"@
+
+  switch($ConsoleKind){
+    'cmd' {
+      $arg = if($Distro){
+        @('/k', "wsl.exe -d `"$Distro`" -- bash -lc `"$($wslInit -replace '"','\"')`"")
+      } else {
+        @('/k', "wsl.exe -- bash -lc `"$($wslInit -replace '"','\"')`"")
+      }
+      $proc = Start-Process cmd.exe -ArgumentList $arg -PassThru
+    }
+    'wt' {
+      $wtCmd = if($Distro){
+        "new-tab --title Jetson-WSL wsl.exe -d `"$Distro`" -- bash -lc `"$($wslInit -replace '"','\"')`""
+      } else {
+        "new-tab --title Jetson-WSL wsl.exe -- bash -lc `"$($wslInit -replace '"','\"')`""
+      }
+      $proc = Start-Process -FilePath wt.exe -ArgumentList $wtCmd -PassThru
+    }
+  }
+
+  if($proc){
+    Start-Sleep -Milliseconds 300
+    [System.IO.File]::WriteAllText($PidFile, $proc.Id.ToString())
+  }
+  return $proc
+}
