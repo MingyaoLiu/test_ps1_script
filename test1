@@ -1,17 +1,21 @@
 [CmdletBinding()]
 param(
-  [string]$LinuxScript = "~/flash_nano.sh",
-  [string]$Distro = "",
+  # Jetson Nano APX VID:PID. Add more if your board re-enumerates differently.
   [string[]]$HardwareIds = @("0955:7f21"),
-  [int]$PollSeconds = 1,
-  [bool]$StopWhenScriptEnds = $true
+  # Optional WSL distro name. Leave blank to use the default.
+  [string]$Distro = "",
+  # Window title for the interactive console we manage.
+  [string]$ConsoleTitle = "Jetson-WSL",
+  # Poll interval
+  [int]$PollSeconds = 1
 )
 
 function Ensure-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   $p  = New-Object Security.Principal.WindowsPrincipal($id)
   if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell";
+    Write-Host "Re-launching as Administrator..." -ForegroundColor Yellow
+    $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell"
     $psi.Arguments = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" " + ($MyInvocation.UnboundArguments -join ' ')
     $psi.Verb = "runas"
     [Diagnostics.Process]::Start($psi) | Out-Null
@@ -20,13 +24,11 @@ function Ensure-Admin {
 }
 
 function Parse-UsbipdList {
-  # Returns objects: BusId, VidPid, Name, StateRaw, IsShared, IsAttachedToWSL
+  # Returns: BusId, VidPid, Name, StateRaw, IsShared, IsAttachedToWSL
   $out = usbipd list 2>$null
   if (-not $out) { return @() }
   $items = @()
-
   foreach ($line in $out) {
-    # Robustly capture: BUSID, VID:PID, NAME (e.g., APX), STATE (e.g., Shared (forced) / Attached - WSL / Not shared)
     $m = [regex]::Match(
       $line,
       '^\s*(?<busid>\d+(?:-\d+)+)\s+(?<vidpid>[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4})\s+(?<name>.+?)\s{2,}(?<state>.+?)\s*$'
@@ -51,7 +53,7 @@ function Find-MatchingDevices {
   $all = Parse-UsbipdList
   if (-not $all) { return @() }
   $want = $Hids | ForEach-Object { $_.ToLower() }
-  return $all | Where-Object { $want -contains $_.VidPid }
+  return @($all | Where-Object { $want -contains $_.VidPid })
 }
 
 function Bind-Attach-IfNeeded {
@@ -59,14 +61,8 @@ function Bind-Attach-IfNeeded {
   if (-not $dev) { return $false }
   $changed = $false
 
-  # Ensure device is shared (bound). "Shared (forced)" and "Attached - WSL" both count as shared.
-  if (-not $dev.IsShared) {
-    & usbipd bind --busid $dev.BusId --force 2>$null | Out-Null
-    $changed = $true
-  } else {
-    # Still try to refresh share in case it flipped states during re-enum; ignore errors.
-    & usbipd bind --busid $dev.BusId --force 2>$null | Out-Null
-  }
+  # Ensure "Shared" (bind). Safe to force on every pass.
+  & usbipd bind --busid $dev.BusId --force 2>$null | Out-Null
 
   # Ensure attached to WSL
   if (-not $dev.IsAttachedToWSL) {
@@ -76,43 +72,47 @@ function Bind-Attach-IfNeeded {
   return $changed
 }
 
+function Ensure-InteractiveWSLConsole {
+  param([string]$Title, [string]$Distro)
+
+  # Is our specific console already open?
+  $existing = Get-Process cmd -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowTitle -eq $Title } |
+              Select-Object -First 1
+
+  if ($existing) { return }
+
+  # Launch a classic cmd window with a distinctive title, then start WSL login shell.
+  # The cmd window title stays visible, so we can find this exact console again.
+  if ($Distro) {
+    $cmd = 'title {0} && wsl.exe -d {1} -- bash --login -i' -f $Title, $Distro
+  } else {
+    $cmd = 'title {0} && wsl.exe -- bash --login -i' -f $Title
+  }
+
+  Start-Process cmd.exe -ArgumentList @('/k', $cmd) | Out-Null
+  Write-Host "Opened interactive WSL console titled '$Title'." -ForegroundColor Cyan
+}
+
 # --- Main ---
 Ensure-Admin
-Write-Host "Polling for Jetson (VID:PID = $($HardwareIds -join ', ')) without auto-attach..." -ForegroundColor Cyan
-
-$scriptStarted = $false
-$wslProc = $null
+Write-Host "Jetson USB watcher started. Console title '$ConsoleTitle'. Poll ${PollSeconds}s." -ForegroundColor Cyan
 
 while ($true) {
+  # 1) Make sure our interactive console exists (launch once if needed)
+  Ensure-InteractiveWSLConsole -Title $ConsoleTitle -Distro $Distro
+
+  # 2) Look for Jetson APX; bind + attach if present and not attached
   $matches = Find-MatchingDevices -Hids $HardwareIds
-
-  if ($matches.Count -gt 0) {
-    # Prefer something already attached to WSL, else first match
-    $dev = ($matches | Where-Object {$_.IsAttachedToWSL} | Select-Object -First 1)
-    if (-not $dev) { $dev = $matches[0] }
-
+  if (@($matches).Count -gt 0) {
+    # Prefer one already attached; else first found
+    $dev = (@($matches | Where-Object { $_.IsAttachedToWSL })[0]) ? (@($matches | Where-Object { $_.IsAttachedToWSL })[0]) : $matches[0]
     $did = Bind-Attach-IfNeeded -dev $dev
     if ($did -or $dev.IsAttachedToWSL) {
-      Write-Host ("OK: {0} {1}  [{2}]" -f $dev.BusId, $dev.VidPid, $dev.StateRaw) -ForegroundColor Green
-    }
-
-    if (-not $scriptStarted -and ($dev.IsAttachedToWSL -or $did)) {
-      $scriptStarted = $true
-      $wslCmd = if ($Distro) {
-        @("wsl.exe","-d",$Distro,"--","bash","-lc",$LinuxScript)
-      } else {
-        @("wsl.exe","--","bash","-lc",$LinuxScript)
-      }
-      Write-Host "Launching inside WSL: $LinuxScript" -ForegroundColor Cyan
-      $wslProc = Start-Process -PassThru -NoNewWindow -FilePath $wslCmd[0] -ArgumentList $wslCmd[1..($wslCmd.Count-1)]
+      Write-Host ("OK: {0} {1} [{2}]" -f $dev.BusId, $dev.VidPid, $dev.StateRaw) -ForegroundColor Green
     }
   } else {
     Write-Host "Waiting for Jetson APX... (hold RECOVERY and plug USB)" -ForegroundColor DarkGray
-  }
-
-  if ($StopWhenScriptEnds -and $scriptStarted -and $wslProc -and $wslProc.HasExited) {
-    Write-Host "WSL script ended (exit $($wslProc.ExitCode)). Stopping poller." -ForegroundColor Yellow
-    break
   }
 
   Start-Sleep -Seconds $PollSeconds
