@@ -57,18 +57,19 @@ function Bind-Attach-IfNeeded($dev){
 }
 
 function Get-TrackedConsole {
-  if(Test-Path $PidFile){
-    $pidText = Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue
-    if($pidText -and $pidText -match '^\d+$'){
-      $p = Get-Process -Id [int]$pidText -ErrorAction SilentlyContinue
-      if($p -and $p.HasExited -eq $false){
+  if (Test-Path $PidFile) {
+    # Read entire file, strip anything that isn't 0-9, then try-parse
+    $raw = Get-Content -LiteralPath $PidFile -Raw -ErrorAction SilentlyContinue
+    $digits = ($raw -replace '[^\d]', '')
+    $pid = 0
+    if ($digits -and [int]::TryParse($digits, [ref]$pid) -and $pid -gt 0) {
+      $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+      if ($p -and -not $p.HasExited) {
         return $p
-      } else {
-        Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
       }
-    } else {
-      Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
     }
+    # Invalid/stale PID → clean up
+    Remove-Item -LiteralPath $PidFile -ErrorAction SilentlyContinue
   }
   return $null
 }
